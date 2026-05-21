@@ -1,39 +1,40 @@
 [tool.poetry]
-name = 'icu-tft'
-version = '0.1.0'
-description = 'ICU 24-hour mortality predicting using a Temporal Fusion Transformer'
-author = ['Ethan Long <ethanklong@gmail.com>, Master's Student at ISEG']
-readme = 'README.md'
-packages = [{include = 'ice_tft', from = 'src'}]
+name = "icu-tft"
+version = "0.1.0"
+description = "ICU 24-hour mortality prediction using a Temporal Fusion Transformer"
+authors = ["Senior ML Engineer <engineer@example.com>"]
+readme = "README.md"
+packages = [{include = "icu_tft", from = "src"}]
 
 [tool.poetry.dependencies]
-python='^3.11'
-torch='^2.2'
-pytorch-lightning='^2.2'
-pandas='^2.2'
-polars='^0.20'
-scikit-learn='^1.4'
-pytorch-forecasting='^1.0
-shap='^1.32'
-python-dotenv = '^1.0'
+python = ">=3.11, <3.15"
+torch = "^2.2"
+pytorch-lightning = "^2.2"
+pandas = "^2.2"
+polars = "^0.20"
+scikit-learn = "^1.4"
+pytorch-forecasting = "^1.0"
+shap = "^0.44"
+streamlit = "^1.32"
+python-dotenv = "^1.0"
 
 [tool.poetry.group.dev.dependencies]
-pytest='^8.1'
-black='^24.2'
-ruff='^0.3'
-pypy='^1.9'
-pre-commit='^3.6'
-nbstripout='^0.7'
-jupyter='^1.0'
+pytest = "^8.1"
+black = "^24.2"
+ruff = "^0.3"
+mypy = "^1.9"
+pre-commit = "^3.6"
+nbstripout = "^0.7"
+jupyter = "^1.0"
 
 [build-system]
-requires=['poetry-core']
-build-backend='poetry.core.masonry.api'
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
 
 [tool.black]
-line-length=88
-target-version=['py311']
+line-length = 88
+target-version = ['py311']
 
 [tool.ruff]
-line-length=99
-target-version='py311'
+line-length = 88
+target-version = "py311"
