@@ -1,5 +1,3 @@
-Ini, TOML
-
 [tool.poetry]
 name = 'icu-tft'
 version = '0.1.0'
