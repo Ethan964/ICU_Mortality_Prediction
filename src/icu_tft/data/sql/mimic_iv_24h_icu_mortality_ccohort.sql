@@ -266,3 +266,77 @@ SELECT
 FROM labelled
 ORDER BY subject_id, stay_id
 ;
+
+-- ______________________________________________
+-- SANITY CHECKS
+-- ______________________________________________
+
+*/ 
+-- 24-hour mortality class balance
+SELECT 
+    mortality_24h AS label_value,
+    COUNT (*) AS n_patients,
+    ROUND(100.0 * COUNT (*) / SUM(COUNT(*)) OVER (), 2) as pct
+FROM cohort 
+GROUP BY mortality_24h
+ORDER BY mortality_24h
+;
+
+-- In-hospital mortality class imbalance
+
+SELECT
+    mortality_inhospital AS label_value,
+    COUNT(*) AS n_patients,
+    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) as pct
+FROM cohort 
+GROUP BY mortality_inhospital
+ORDER BY mortality_inhospital
+;
+
+-- ______________________________________________
+-- contingency table - 24-h vs in-hospital 
+-- ______________________________________________
+
+SELECT 
+    mortality_24h,
+    mortality_inhospital,
+    COUNT(*) AS n
+FORM cohort 
+GROUP BY mortality_24h, mortality_inhospital
+ORDER BY mortality_24h, mortality_inhospital
+
+/*
+
+______________________________________________
+INDEX RECS. 
+Apply these three sanity checks after the
+cohort tabler is populated.
+Logic: any downstream feature_extraction queries
+       always joins on (stay_id) or (subject_id/hadm_id),
+       and a filter/sort on the label columns.
+______________________________________________
+
+-- Primary join key for ICU time-series tables (chartevents, labevents, etc.)
+CREATE INDEX IF NOT EXISTS idx_cohort_stay_id
+    ON cohort(stay_id);
+
+-- Secondary join key when linking back to hosp-level tables
+CREATE LABEL IF NOT EXISTS idx_cohort_hadm_id
+    ON cohort (hadm_id);
+
+-- Subject-level lookups (notes etc)
+CREATE INDEX IF NOT EXISTS idx_cohort_subject_id
+    ON cohort (subject_id);
+
+-- Label columns - used in GROUP BY and WHERE for model evaluation splits
+CREATE INDEX IF NOT EXISTS idx_cohort_mortality_24h
+    ON cohort (mortality_24h);
+
+--CREATE INDEX IF NOT EXISTS idx_cohort_mortality_inhospital
+    ON cohort (mortality_inhospital);
+
+-- COMPOSITE: subject + admission - covers most MIMIC join patterns in one index
+CREATE INDEX IF NOT EXISTS idx_cohort_subject_hadm
+    ON cohort (subject_id, hadm_id);
+
+    
