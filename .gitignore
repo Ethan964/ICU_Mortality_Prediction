@@ -14,6 +14,10 @@ data/processed/*
 !data/raw/.gitkeep
 !data/interim/.gitkeep
 !data/processed/.gitkeep
+*.duckdb
+*.db
+*.parquet
+*.csv
 
 # Model Checkpoints (Exclude files >100MB handled by PyTorch Lightning)
 models/*
