@@ -256,3 +256,369 @@ def _add_missingness_indicators(df: pl.DataFrame, features: list[str]) -> pl.Dat
         for f in features
     ]
     return df.with_columns(indicator_exprs)
+
+
+# ----------------------------------------------
+# Query Builders 
+# ----------------------------------------------
+
+def _query_chartevents(stay_ids: list[int]) -> str:
+    '''
+    builds a parameterized SQL query to pull relevant cchartevent rows.
+    
+    Returns only rows within the first 24 hours of ICU admission, joined 
+    to icustays to compute the hours-since-admission offset. 
+    
+    Params
+    --------
+    SQL string compatable with DuckDb and PostgreSQL.
+    '''
+    all_vital_signs = _itemid_filter_expr(VITAL_ITEMIDS)
+    ids_sql = ",".join(str(i) for i in all_vital_signs)
+    stay_ids_sql = ', '.join(str(i) for i in stay_ids)
+
+    return f'''
+    SELECT
+        ce.stay_id, 
+        cec.itemid,
+        ce.charttime, 
+        ce.valuenum,
+        ie.intime,
+        -- Hours since ICU admission, floored to int. bin index.
+        FLOOR(
+            EXTRACT(EPOCH FROM (ce,.charttime - ie.intime)) / 3600.0
+            )::INTEGER          AS time_step
+        FROM mimic_icu.chartevents AS ce
+        INNER JOIN mimic_icu.icustays AS ie
+            ON ce.stay_id = ie.stay_id
+        WHERE 
+            ce.stay_id      IN ({stay_ids_sql})
+            AND ce.item_id  IN ({ids_sql})
+            -- Only Values recorded during the 24-hour observation window
+            AND ce.charttime >= ie.intime
+            AND ce.charttime < ie.intime + INTERVAL '24 hours'
+            -- Exclude null / zero values common in MIMIC
+            AND ce.valuenum IS NOT NULL
+            AND ce.error IS DISTINCT FROM 1
+        ORDER BY ce.stay_id, time_step, ce.charttime 
+    '''
+
+def _query_labevents(hadm_ids: list[int], stay_ids_to_intime: dict[int, str]) -> str:
+    '''
+    SQL query that pulls lab values within the 24-hour ICU window.
+    
+    labevents links to hadm_id, not stay_id, so we join back to icustays to recover intime for the correct first ICU stay.
+
+    Params
+    ---------
+    hadm_ids:
+        hopsital admission ids corresponding to the cohort.
+
+    stay_ids: 
+        Mapping of stay_id -> intime ISO string used to push the time filter as close to the source as possible. 
+
+    Returns
+    ---------
+    SQL string
+    '''
+    all_lab_ids = _itemid_filter_expr(LAB_ITEMIDS)
+    ids_sql = ', '.join(str(i) for i in all_lab_ids)
+    hadm_ids_sql = ', '.join(str(i) for i in hadm_ids)
+
+    return f'''
+    SELECT
+        ie.stay_id,
+        le.itemid,
+        le.charttime,
+        le.valuenum,
+        ie.intime,
+        FLOOR(
+            EXTRACT(EPOCH FROM (le.charttime - ie.intime)) / 3600.0
+            )::INTEGER          AS time_step
+    FROM mimic_hosp.labevents AS le
+    -- Join to icustays to get the first ICU stay's intime for the admission
+    INNER JOIN mimic_icu.icustays AS ie
+        ON le.hadm_id = ie.hadm_id
+    WHERE 
+        le.hadm_id IN ({hadm_ids_sql})
+        AND le.itemid IN ({ids_sql})
+        AND le.charttime >= ie.intime
+        AND le.charttime < ie.intime + INTERVAL '24 hours'
+        AND le.valuenum IS NOT NULL
+        -- quick status flag, 'D' marks deleted results in some MIMIC versions BEWARE
+        AND (le.flag IS NOT NULL OR le.flag != 'delta')
+    ORDER BY ie.stay_id, time_step, le.charttime 
+    '''
+
+# ----------------------------------------------
+# Transformations 
+# ----------------------------------------------
+
+def _raw_to_feature_frame(
+        raw: pl.DataFrame,
+        ids_to_features: dict[int, str],
+        is_vitals: bool,
+        ) -> pl.DataFrame:
+    '''
+    Maps itemids to feature names, apply unit conversions, and bins into hour intervals.
+
+    Steps
+    -------- 
+    1. Map itemid -> feature_name via id_to_feature func.
+    2. Apply temperature F to C conversion for temperature_c feature
+    3. Group by (stay_id, time_step, feature_name), take first non-null value.
+    4. Pivot to wide format" one column per feature
+
+    Params
+    --------- 
+    Wide polars: DataFrame with columns [stay_id, time_step, feature_1, ....]
+    '''
+
+    if raw.is_empty():
+        return pl.DataFrame(schema={'stay_id' = pl.Int64, 'time_step': pl.Int32})
+    
+    feature_map_series = raw['item_id'].map_elements(
+        lambda x: id_to_feature.get(x, '__drop__'), return_dtype=pl.String
+    )
+
+    df = raw.with_columns(feature_map_series.alias('feature_name'))
+    df = df.filter(pl.col('feature_name') != '__drop__')
+
+    # temp conversion
+    if is_vitals:
+        df = df.with_columns(
+            pl.when(pl.col('feature_name') == 'temperature_c')
+            .then(_fahrenheit_to_celsius(pl.col('valenum')))
+            .otherwise(pl.col('valuenum'))
+            .alias('valuenum')
+        )
+        # first valid value per (stay_id, time_step, feature_name)
+        # sort is already done in SQL then the group by perserves first row order in Polars
+        # when maintain_order=True
+    binned = (
+        df.sort(['stay_id', 'time_step', 'charttime'])
+        .group_by(['stay_id', 'time_step', 'charttime'], maintain_order=True)
+        .agg(pl.col('valuenum').first().alias('value'))
+    )
+    wide = binned.pivot(
+        values='value',
+        index=['stay_id', 'time_step'],
+        on='feature_name',
+        aggregate_function='first'
+    )
+
+    return wide
+
+def _build_skeleton(stay_ids: list[int]) -> pl.DataFrame:
+    '''
+    Creates a complete stay_id by time_step grid for hours 0-23
+
+    This ensures every stay gets exactly 24 rows regardless of whether observations exist,
+    ensuring the final tensor is dense and uniformly shaped.
+    
+    Params
+    --------
+    stay_ids: 
+        All stay_ids in the cohort
+    
+    Returns
+    --------
+    Polars dataframe with columns [stay_id (Int64), time_step (Int 32)].
+    '''
+
+    stays = pl.DataFrame({'stay_id' : stay_ids}).cast({'stay_id': pl.Int64})
+    hours = pl.DataFrame({'time_step' : list(range(N_HOURS))}).cast({'time_step' : pl.Int32})
+
+    # return a cross join to produce all cocmbinations of stay_id and time_steps
+    return stays.join(hours, how='cross')
+
+
+def _combine_gcs(df: pl.DataFrame) -> pl.DataFrame:
+    '''
+    Sum GCS component columns into gcs_total and drop the component columns.
+
+    gcs_total = gcs_eyes + gcs_motor + gcs_verbal (range 3-15).
+
+    If any component is null for a given bin, gcs_total is null for that bin
+    (sum of nulls is null in Polars, use fill_null(0) only if all three components are
+    expeceted to coincide, which they can in MIMIC-IV)
+    
+    Handling Missingness: if ALL three components are null = null total score.
+    If some are null, we treat gcs_total partial_null as null total to be conservative.
+
+    Params
+    -------
+    df: 
+        wide DataFrame potentially containing gcs_verbal, gcs_motor, gcs_eyes
+
+    Returns
+    -------
+    DataFrame with gcs_total column replacing individual GCS components.
+    '''
+    present = [c for c in GCS_COMPONENTS if c in df.columns]
+    if not present:
+        if 'gcs_total' not in df.columns:
+            df = df.with_columns(pl.lit(None).cast(pl.Float64).alias('gcs_total'))
+        return df
+    
+    if len(present) == 3:
+        df = df.with_columns(
+            (pl.col('gcs_eyes') + pl.col('gcs_motor') + pl.col('gcs_verbal'))
+            .alias('gcs_total')
+        )
+    else:
+        df = df.with_columns(
+            sum(pl.col(c) for c in present).alias('gcs_total')
+        )
+    df = df.drop([c for c in GCS_COMPONENTS if c in df.columns])
+    return df
+
+def _ensure_all_feature_columns(df: pl.DataFrame, features: list[str]) -> pl.DataFrame:
+    '''
+    Add any missing features columns as null float64s.
+
+    This func gusrentees the DataFrame has exactly the expected column set regardless of
+    which features had observations in this cohort/batch of patients.
+
+    Params
+    -------
+    df:
+        polars DataFrame that may be missing some feature columns.
+
+    features: 
+        Full list of features that will be checked for missing some feature columns.
+
+    Returns
+    -------
+    DataFrame with all feature columns present (where nulls absent).
+    '''
+
+    for feat in features:
+        if feat not in df.columns:
+            df = df.with_columns(pl.lit(None).cast(pl.Float64).alias(feat))
+    return df
+
+
+# ----------------------------------------------
+# Public APIs 
+# ----------------------------------------------
+
+def build_timeseries(
+        cohort: pd.DataFrame,
+        con: duckdb.DuckDBPyConnection,
+) -> pd.DataFrame:
+    '''
+    Extract and preprocesses a 24-hour time-series for every patient's icu stay
+
+    This will serve as the main entry point for this module. It orchestrates SQL extraction,
+    Polars-based (aggregation, labelling, foward-filling, filtering, and missingness flagging)
+
+    Params
+    -------
+    cohort:
+        Pandas DF produced by the cohort SQl script : ../src/icu_tft/data/sql/mimic_iv_24h_icu_mortality_cohort.sql
+        Must contain at minumum: stay_id (int), hadm_id (int).
+    
+    con:
+        Active DuckDB connection pointing at the database with mimic_icu and mimic_hosp schemas attached.
+
+    Returns
+    -------
+    pandas.DataFrame
+    Indexed by (stay_id, time_step). Columns:
+        - One float32 column per feature in ALL_FEATURES
+        - One Into binary column per feature named <feature>_missing.
+        Shape: (n_patients x 24) rows x (n_features x 2) columns.
+
+    Raises
+    -------
+    ValueError: 
+        If cohort is empty or missing required columns
+    '''
+    required_cols = {'stay_id', 'hadm_id'}
+    missing_cols = required_cols - set(cohort.columns)
+    if missing_cols:
+        return ValueError(f'Cohort DataFrame missing required columns: {missing_cols}')
+    if cohort.empty:
+        raise ValueError(f'Cohort DataFrame is empty, extracting nothing')
+    
+    stay_ids: list[int] = cohort['stay_id'].tolist()
+    hadm_id: list[int] = cohort['hadm_id'].tolist()
+
+    logger.info('Extracting chartevents for %d ICU stays.', len(stay_ids))
+    chart_sql = _query_chartevents(stay_ids)
+    chart_raw_pd = con.execute(chart_sql).df()
+    chart_raw = pl.from_pandas(chart_raw_pd)
+
+    logger.info('Extracting labevents for %d ICU stays.', len(hadm_ids))
+    lab_sql = _query_labevents(hadm_ids)
+    lab_raw_pd = con.execute(lab_sql).df()
+    lab_raw = pl.from_pandas(lab_raw_pd)
+
+    # Map items to feature names and bin into hours
+    vital_id_map = _build_id_to_feature(VITAL_ITEMIDS)
+    lab_id_map = _build_id_to_feature(LAB_ITEMIDS)
+
+    logger.info('Aggregating vitals into hourly bins')
+    vitals_wide = _raw_to_feature_frame(chart_raw, vital_id_map, is_vitals=True)
+
+    logger.info('Aggregating labs into hourly bins')
+    labs_wide = _raw_to_feature_frame(lab_raw, lab_id_map, is_vitals=False)
+
+    skeleton = _build_skeleton(stay_ids)
+
+    skeleton = skeleton.with_columns([
+        pl.col('stay_id').cast(pl.Int64),
+        pl.col('time_step').cast(pl.Int32),
+    ])
+
+    def _safe_join(base: pl.DataFrame, other: pl.DataFrame) -> pl.DataFrame:
+        '''Left join other onto base, returns base unchanged if other is empty '''
+        if other.is_empty() or 'stay_id' not in other.columns:
+            return base
+        other = other.with_columns([
+            pl.col['stay_id'].cast(pl.Int64),
+            pl.col['time_stemp'].cast(pl.Int32),
+        ])
+        return base.join(other, on=['stay_id', 'time_step'], how='left')
+    df = _safe_join(skeleton, vitals_wide)
+    df = _safe_join(df, labs_wide)
+
+
+    # Collapse GCS components -> gcs_total
+    df = _combine_gcs(df)
+
+    # Ensure all features are present
+    df = _ensure_all_feature_columns(df, ALL_FEATURES)
+
+    # Clip out of range results
+    logger.info('Clipping out-of-range results')
+    df = _clip_values(df, CLIPS_BOUNDS)
+
+    # forward fill within each stay
+    logger.info('Foward Filling gaps up to %d hours', MAX_FORWARD_FILL_HOURS)
+    df = _forward_fill_with_limit(df, ALL_FEATURES, limit=MAX_FORWARD_FILL_HOURS)
+
+    # Add binary missingness indicator
+    df = _add_missingness_indicators(df, ALL_FEATURES)
+
+    # Cast features column to float32 to halve memory allocation
+    float_casts = {f: pl.float32 for f in ALL_FEATURES}
+    df = df.cast(float_casts)
+
+    # final column ordering
+    missing_cols_order = [f'{f}_missing' for f in ALL_FEATURES]
+    final_cols = ['stay_id', 'time_step'] + ALL_FEATURES + missing_cols_order
+    df = df.select([c for c in final_cols if c in df.columns])
+
+    # covert to pandas and set MultiIndex
+    logger.info('Converting DF to Pandas')
+    pdf = df.to_pandas()
+    pdf = pdf.sort_values(['stay_id', 'time_step']).reset_index(drop=True)
+    pdf = pdf.set_index(['stay_id', 'time_step'])
+
+    logger.info('Extraction complete. Shape: %s | Memory: %.1f MB',
+                pdf.shape,
+                pdf.memory_usage(deep=True).sum() / 1e6,
+    )
+    return pdf
