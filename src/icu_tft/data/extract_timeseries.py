@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 #       constants 
 # -----------------------
 
-# taking vital signas from mimic_icu.chartevents.
+# taking vital signals from mimic_icu.chartevents.
 # key  = standard feature name used throughout this module
 # value = list of mimic-iv item ids that map to that feature
 
@@ -293,15 +293,14 @@ def _query_chartevents(stay_ids: list[int]) -> str:
             ON ce.stay_id = ie.stay_id
         WHERE 
             ce.stay_id      IN ({stay_ids_sql})
-            AND ce.itemid  IN ({ids_sql})
+            AND ce.itemid   IN ({ids_sql})
             -- Only Values recorded during the 24-hour observation window
             AND ce.charttime >= ie.intime
             AND ce.charttime < ie.intime + INTERVAL '24 hours'
-            -- Exclude null / zero values common in MIMIC
+            -- Exclude null values common in MIMIC
             AND ce.valuenum IS NOT NULL
-            AND ce.error IS DISTINCT FROM 1
-        ORDER BY ce.stay_id, time_step, ce.charttime 
-    '''
+        ORDER BY ce.stay_id, time_step, ce.charttime
+'''
 
 def _query_labevents(hadm_ids: list[int], stay_ids_to_intime: dict[int, str]) -> str:
     '''
