@@ -30,7 +30,7 @@ Usage
     con = duckdb.connect('mimic.duckdb')
     cohort = pd.read_sql('SELECT * FROM cohort', con)       # not reading parquet, feather, or csv, files to large
     ts = build_timeseries(cohort, con)
-    validate_report(ts)
+    validate_cohort(ts)
 """
 
 
@@ -62,7 +62,7 @@ VITAL_ITEMIDS: Final[dict[str, list[int]]] = {
     'mbp'               :             [220052],
     'spo2'              :             [220277],
     'resp_rate'         :             [220210],
-    'tempurature_c'     :             [223761],
+    'temperature_c'     :             [223761],
     'gcs_verbal'        :             [223900],
     'gcs_motor'         :             [223901],
     'gcs_eyes'          :             [220739],
@@ -85,7 +85,7 @@ LAB_ITEMIDS: Final[dict[str, list[int]]] = {
 }   
 
 # components sums up all gcs features into one single gcs_total feature
-GCS_COMPONENTS : Final[list[str]] = ['gcs_verbal', 'gcs_motar', 'gcs_eyes']
+GCS_COMPONENTS : Final[list[str]] = ['gcs_verbal', 'gcs_motor', 'gcs_eyes']
 
 # max. number of consecutive hours to forward fill a missing value.
 # gaps longer than this are left as NaN to avoid erronious data imputation.
@@ -114,7 +114,7 @@ CLIPS_BOUNDS: Final[dict[str, tuple[float, float]]] = {\
     'resp_rate'         :             (0.0, 80.0),
     
     # temperature: becareful with degree conversion
-    'tempurature_c'     :             (25.0, 45.0),
+    'temperature_c'     :             (25.0, 45.0),
     
     # gcs components
     'gcs_verbal'        :             (1.0, 5.0),
@@ -223,9 +223,9 @@ def _forward_fill_with_limit(df: pl.DataFrame, features: list[str], limit: int) 
     pl.DataFrame with forward-filled values.
     '''
 
-    fill_exprs_exprs = [
+    fill_exprs = [
         pl.col(f).forward_fill(limit=limit).over('stay_id')
-        for f in features:
+        for f in features
     ]
     non_feature_cols = [c for c in df.columns if c not in features]
     return df.sort(['stay_id', 'time_step']).with_columns(fill_exprs)
@@ -280,20 +280,20 @@ def _query_chartevents(stay_ids: list[int]) -> str:
     return f'''
     SELECT
         ce.stay_id, 
-        cec.itemid,
+        ce.itemid,
         ce.charttime, 
         ce.valuenum,
         ie.intime,
         -- Hours since ICU admission, floored to int. bin index.
         FLOOR(
-            EXTRACT(EPOCH FROM (ce,.charttime - ie.intime)) / 3600.0
+            EXTRACT(EPOCH FROM (ce.charttime - ie.intime)) / 3600.0
             )::INTEGER          AS time_step
         FROM mimic_icu.chartevents AS ce
         INNER JOIN mimic_icu.icustays AS ie
             ON ce.stay_id = ie.stay_id
         WHERE 
             ce.stay_id      IN ({stay_ids_sql})
-            AND ce.item_id  IN ({ids_sql})
+            AND ce.itemid  IN ({ids_sql})
             -- Only Values recorded during the 24-hour observation window
             AND ce.charttime >= ie.intime
             AND ce.charttime < ie.intime + INTERVAL '24 hours'
@@ -375,10 +375,10 @@ def _raw_to_feature_frame(
     '''
 
     if raw.is_empty():
-        return pl.DataFrame(schema={'stay_id' = pl.Int64, 'time_step': pl.Int32})
+        return pl.DataFrame(schema={'stay_id' : pl.Int64, 'time_step': pl.Int32})
     
     feature_map_series = raw['item_id'].map_elements(
-        lambda x: id_to_feature.get(x, '__drop__'), return_dtype=pl.String
+        lambda x: ids_to_features.get(x, '__drop__'), return_dtype=pl.String
     )
 
     df = raw.with_columns(feature_map_series.alias('feature_name'))
@@ -388,7 +388,7 @@ def _raw_to_feature_frame(
     if is_vitals:
         df = df.with_columns(
             pl.when(pl.col('feature_name') == 'temperature_c')
-            .then(_fahrenheit_to_celsius(pl.col('valenum')))
+            .then(_fahrenheit_to_celsius(pl.col('valuenum')))
             .otherwise(pl.col('valuenum'))
             .alias('valuenum')
         )
@@ -543,7 +543,7 @@ def build_timeseries(
         raise ValueError(f'Cohort DataFrame is empty, extracting nothing')
     
     stay_ids: list[int] = cohort['stay_id'].tolist()
-    hadm_id: list[int] = cohort['hadm_id'].tolist()
+    hadm_ids: list[int] = cohort['hadm_id'].tolist()
 
     logger.info('Extracting chartevents for %d ICU stays.', len(stay_ids))
     chart_sql = _query_chartevents(stay_ids)
@@ -577,8 +577,8 @@ def build_timeseries(
         if other.is_empty() or 'stay_id' not in other.columns:
             return base
         other = other.with_columns([
-            pl.col['stay_id'].cast(pl.Int64),
-            pl.col['time_stemp'].cast(pl.Int32),
+            pl.col('stay_id').cast(pl.Int64),
+            pl.col('time_step').cast(pl.Int32),
         ])
         return base.join(other, on=['stay_id', 'time_step'], how='left')
     df = _safe_join(skeleton, vitals_wide)
