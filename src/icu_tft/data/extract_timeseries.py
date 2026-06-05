@@ -252,7 +252,7 @@ def _add_missingness_indicators(df: pl.DataFrame, features: list[str]) -> pl.Dat
 
     '''
     indicator_exprs = [
-        pl.col(f).is_null.cast(pl.Int8).alias(f'{f}_missing')
+        pl.col(f).is_null().cast(pl.Int8).alias(f'{f}_missing')
         for f in features
     ]
     return df.with_columns(indicator_exprs)
@@ -302,7 +302,7 @@ def _query_chartevents(stay_ids: list[int]) -> str:
         ORDER BY ce.stay_id, time_step, ce.charttime
 '''
 
-def _query_labevents(hadm_ids: list[int], stay_ids_to_intime: dict[int, str]) -> str:
+def _query_labevents(hadm_ids: list[int]) -> str:
     '''
     SQL query that pulls lab values within the 24-hour ICU window.
     
@@ -346,7 +346,7 @@ def _query_labevents(hadm_ids: list[int], stay_ids_to_intime: dict[int, str]) ->
         AND le.valuenum IS NOT NULL
         -- quick status flag, 'D' marks deleted results in some MIMIC versions BEWARE
         AND (le.flag IS NOT NULL OR le.flag != 'delta')
-    ORDER BY ie.stay_id, time_step, le.charttime 
+    ORDER BY ie.stay_id, time_step, le.charttime
     '''
 
 # ----------------------------------------------
@@ -376,7 +376,7 @@ def _raw_to_feature_frame(
     if raw.is_empty():
         return pl.DataFrame(schema={'stay_id' : pl.Int64, 'time_step': pl.Int32})
     
-    feature_map_series = raw['item_id'].map_elements(
+    feature_map_series = raw['itemid'].map_elements(
         lambda x: ids_to_features.get(x, '__drop__'), return_dtype=pl.String
     )
 
@@ -396,13 +396,13 @@ def _raw_to_feature_frame(
         # when maintain_order=True
     binned = (
         df.sort(['stay_id', 'time_step', 'charttime'])
-        .group_by(['stay_id', 'time_step', 'charttime'], maintain_order=True)
+        .group_by(['stay_id', 'time_step', 'feature_name'], maintain_order=True)
         .agg(pl.col('valuenum').first().alias('value'))
     )
     wide = binned.pivot(
         values='value',
         index=['stay_id', 'time_step'],
-        on='feature_name',
+        columns='feature_name',
         aggregate_function='first'
     )
 
