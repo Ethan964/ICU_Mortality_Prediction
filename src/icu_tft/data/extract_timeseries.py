@@ -622,3 +622,54 @@ def build_timeseries(
                 pdf.memory_usage(deep=True).sum() / 1e6,
     )
     return pdf
+
+
+def validate_cohort(ts: pd.DataFrame) -> None:
+    '''
+    Prints a diagnostic summary of the extracted time-series cohort.
+    
+    Report includes: 
+    -----------------
+    - n_patients : totoal unique stay_ids
+    - n_with_complete_24h : stays with all 24 time steps present
+    - mean missingness : per feature fraction of null values (which is computed after forward fill, reflecting true data missingness).
+    
+    Params
+    -------
+    ts: 
+        DataFrame returned by build_timeseries(), indexed by (stay_id, time_step).
+    '''
+    
+    stay_ids = ts.index.get_level_values('stay_id').unique()
+    n_patients = len(stay_ids)
+    
+    # calculation of complete stays
+    row_counts = ts.groupby(level='stay_id').size()
+    n_complete = int((row_counts == N_HOURS).sum())
+    
+    # missingness measure per feature
+    missing_cols = [c for c in ts.columns if c.endswith('_missing')]
+    if missing_cols:
+        miss_rates = ts[missing_cols].mean().rename(
+            lambda c: c.replace('_missing', '')
+        )
+    else:
+        feature_cols = [c for c in ts.columns if c in ALL_FEATURES]
+        miss_rates = ts[feature_cols].isnull().mean()
+    
+    # function output section
+    print('=' * 50)
+    print(' COHORT TIME-SERIES VALIDATION REPORT')
+    print('=' * 50)
+    print(f' Total patients (stay_ids) : {n_patients:>8,}')
+    print(f'  Patients with complete 24 h  : {n_complete:>8,}  '
+          f'({100 * n_complete / max(n_patients, 1):.1f}%)')
+    print(f' Dataset Shape : {ts.shape}')
+    print()
+    print(' Mean Missingness per feature (after foward fill): ')
+    print(' ' + '-' * 40)
+    for feature, rate in miss_rates.sort_values(ascending=False).items():
+        bar = '█' * int(rate * 20)
+        print(f'  {feature:<20s}  {rate:5.1%}  {bar}')
+    print('=' * 60)        
+    
