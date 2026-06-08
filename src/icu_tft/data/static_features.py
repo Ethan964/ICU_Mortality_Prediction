@@ -124,14 +124,14 @@ def extract_demographics_and_context(cohort: pd.DataFrame) -> pd.DataFrame:
     # binning cohort based on age
     df['age'] = df['anchor_age'].astype(float)
     df['age_binned'] = pd.cut(
-        df['age'],
-        bins=[0, 40, 60, 75, 100],
-        labels=[0, 1, 2, 3],
+        df['age'], 
+        bins=[0, 40, 60, 75, 150], 
+        labels=[0, 1, 2, 3], 
         right=False
     ).astype(int)
     
     # gender binning
-    df['gender_M'] = df['gender'].map(({'M' : 1, 'F' : 0}).astype(int))
+    df['gender_M'] = df['gender'].map({'M' : 1, 'F' : 0}).astype(int)
     
     # race (being categorical, one-hot encoding)
     race_map = {
@@ -169,8 +169,8 @@ def extract_elixhauser(cohort: pd.DataFrame, con: duckdb.DuckDBPyConnection) -> 
     sourced from various literature: val Walraven (2009) & Quan et al (2005).
     '''
     
-    hadm_ids = tuple(cohort['hadm_id'].unique())
-    query = '''
+    hadm_ids = tuple(cohort['hadm_id'].unique().tolist())
+    query = f'''
     SELECT hadm_id, icd_code, icd_version
     FROM mimic_hosp.diagnoses_icd
     WHERE hadm_id IN {hadm_ids}
@@ -243,11 +243,11 @@ def extract_severity_proxies(cohort: pd.DataFrame, con: duckdb.DuckDBPyConnectio
     This function serves as a early-warning static baseline feature.
     
     '''
-    stay_ids = tuple(cohort['stay_id'].unique())
+    stay_ids = tuple(cohort['stay_id'].unique().tolist())
     
     # ids for min_map : 220052, max_latacte : 50813, gcs : {223900, 223901, 220739}
     
-    query = '''
+    query = f'''
         SELECT 
             ce.stay_id, 
             MIN(CASE WHEN ce.itemid = 220052 THEN ce.valuenum END) AS severity_min_map_6h,
@@ -257,7 +257,7 @@ def extract_severity_proxies(cohort: pd.DataFrame, con: duckdb.DuckDBPyConnectio
         WHERE ce.stay_id IN {stay_ids}
             AND ce.itemid IN (220052, 50813)
             AND ce.charttime >= ie.intime
-            AND ce.charttime <= ie.intime + INTERVAL '6 hours
+            AND ce.charttime <= ie.intime + INTERVAL '6 hours'
             AND ce.valuenum IS NOT NULL
         GROUP BY ce.stay_id
     '''
