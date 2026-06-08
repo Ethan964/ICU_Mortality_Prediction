@@ -602,7 +602,7 @@ def build_timeseries(
     df = _add_missingness_indicators(df, ALL_FEATURES)
 
     # Cast features column to float32 to halve memory allocation
-    float_casts = {f: pl.float32 for f in ALL_FEATURES}
+    float_casts = {f: pl.Float32 for f in ALL_FEATURES}
     df = df.cast(float_casts)
 
     # final column ordering
