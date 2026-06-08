@@ -17,6 +17,7 @@ pytorch-forecasting = "^1.0"
 shap = "^0.44"
 streamlit = "^1.32"
 python-dotenv = "^1.0"
+duckdb = "^1.5.3"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1"
