@@ -334,8 +334,8 @@ def feature_summary(df: pd.DataFrame) -> pd.DataFrame:
                 print(f' {val} : {pct:.1%}')
         else:
             desc= df[col].describe()
-            print(f' Mean: {desc['mean']:.2f} | Std Dev : {desc['std']:.2f}')
-            print(f' Min: {desc['min']:.2f} | Median: {desc['50%']:.2f} | Max: {desc['max']:.2f}')
+            print(f" Mean: {desc['mean']:.2f} | Std Dev : {desc['std']:.2f}")
+            print(f" Min: {desc['min']:.2f} | Median: {desc['50%']:.2f} | Max: {desc['max']:.2f}")
             
     print('=' * 50)
     
