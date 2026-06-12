@@ -119,13 +119,13 @@ admission_info AS (
     a.hadm_id,
     a.admittime,
     a.dischtime,
-    a.admissions_type,
+    a.admission_type,
     a.insurance,
     a.language,
     a.marital_status,
     a.race,
     a.hospital_expire_flag,                     -- PhysioNet in-hospital mortality flag (0/1)
-    a.deathtime                                 -- timestamp of in-hospital death
+    a.deathtime,                                 -- timestamp of in-hospital death
     -- Hospital LOS in fractional hours
     EXTRACT(EPOCH FROM (a.dischtime - a.admittime)) / 3600.0
                                             AS hospital_los_hours
@@ -151,7 +151,7 @@ joined AS (
         pi.anchor_age,
         pi.age_at_icu_admission,
         pi.dod,
-        ai.admissions_type,
+        ai.admission_type,
         ai.insurance,
         ai.marital_status,
         ai.race,
@@ -160,7 +160,7 @@ joined AS (
         ai.deathtime
     FROM first_icu      AS fi
     INNER JOIN patient_info AS pi ON fi.stay_id = pi.stay_id
-    INNER JOIN admission_info AS ai on fi.hadm_id_id = ai.hadm_id
+    INNER JOIN admission_info AS ai on fi.hadm_id = ai.hadm_id
 ),
 
 
@@ -171,7 +171,7 @@ joined AS (
 filtered AS (
     SELECT 
         *
-        FROM JOINED 
+        FROM joined 
         WHERE 
             -- Criteria A: Adult patients ( age ≥ 18 at ICU admission)
             age_at_icu_admission >= 18
@@ -221,7 +221,7 @@ labelled AS(
         hospital_los_hours,
         insurance,
         race,
-        marital_status
+        marital_status,
 
             -- mortality_24h ______________________________________________
             -- 1 if the patient's date of death is on or before the calendar
@@ -235,7 +235,7 @@ labelled AS(
                 AND dod <= DATE(icu_intime + INTERVAL '24 hours')
             THEN 1
             ELSE 0
-        END                 AS mortality_24h
+        END                 AS mortality_24h,
 
         -- mortality_inhospital
         -- Directly from mimic_hosp.admissions.hospital_expire_flag (0/1).
@@ -266,78 +266,6 @@ SELECT
     marital_status
 FROM labelled
 ORDER BY subject_id, stay_id
-;
 
--- ______________________________________________
--- SANITY CHECKS
--- ______________________________________________
-
-*/ 
--- 24-hour mortality class balance
-SELECT 
-    mortality_24h AS label_value,
-    COUNT (*) AS n_patients,
-    ROUND(100.0 * COUNT (*) / SUM(COUNT(*)) OVER (), 2) as pct
-FROM cohort 
-GROUP BY mortality_24h
-ORDER BY mortality_24h
-;
-
--- In-hospital mortality class imbalance
-
-SELECT
-    mortality_inhospital AS label_value,
-    COUNT(*) AS n_patients,
-    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) as pct
-FROM cohort 
-GROUP BY mortality_inhospital
-ORDER BY mortality_inhospital
-;
-
--- ______________________________________________
--- contingency table - 24-h vs in-hospital 
--- ______________________________________________
-
-SELECT 
-    mortality_24h,
-    mortality_inhospital,
-    COUNT(*) AS n
-FROM cohort 
-GROUP BY mortality_24h, mortality_inhospital
-ORDER BY mortality_24h, mortality_inhospital
-
-/*
-
-______________________________________________
-INDEX RECS. 
-Apply these three sanity checks after the
-cohort tabler is populated.
-Logic: any downstream feature_extraction queries
-       always joins on (stay_id) or (subject_id/hadm_id),
-       and a filter/sort on the label columns.
-______________________________________________
-
--- Primary join key for ICU time-series tables (chartevents, labevents, etc.)
-CREATE INDEX IF NOT EXISTS idx_cohort_stay_id
-    ON cohort(stay_id);
-
--- Secondary join key when linking back to hosp-level tables
-CREATE INDEX IF NOT EXISTS idx_cohort_hadm_id
-    ON cohort (hadm_id);
-
--- Subject-level lookups (notes etc)
-CREATE INDEX IF NOT EXISTS idx_cohort_subject_id
-    ON cohort (subject_id);
-
--- Label columns - used in GROUP BY and WHERE for model evaluation splits
-CREATE INDEX IF NOT EXISTS idx_cohort_mortality_24h
-    ON cohort (mortality_24h);
-
---CREATE INDEX IF NOT EXISTS idx_cohort_mortality_inhospital
-    ON cohort (mortality_inhospital);
-
--- COMPOSITE: subject + admission - covers most MIMIC join patterns in one index
-CREATE INDEX IF NOT EXISTS idx_cohort_subject_hadm
-    ON cohort (subject_id, hadm_id);
 
     
