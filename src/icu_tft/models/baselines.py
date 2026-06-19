@@ -355,13 +355,13 @@ def _build_logreg_pipeline(
     
     numeric_transformer = Pipeline(
         steps=[
-            ('imputer', SimpleImputer(strategy='median'),
-             'scaler', StandardScaler())
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler())
         ]
     )
     
     preprocessor = ColumnTransformer(
-        transformer=[
+        transformers=[
             ('num', numeric_transformer, feature_cols),
         ],
         remainder='drop',
@@ -436,7 +436,7 @@ def fit_logreg_baseline(
     
     param_grid = {
         'clf__C': [0.001, 0.01, 0.1, 1.0, 10.0],
-        'clf_l1_ratio': [0.1, 0.3, 0.5, 0.7, 0.9],
+        'clf__l1_ratio': [0.1, 0.3, 0.5, 0.7, 0.9],
     }            
     base_pipeline = _build_logreg_pipeline(feature_cols)
     cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=617)
@@ -450,7 +450,7 @@ def fit_logreg_baseline(
         param_grid=param_grid,
         scoring='roc_auc',
         cv=cv,
-        n_jons=-1,
+        n_jobs=-1,
         refit=True,
         verbose=0
     )
@@ -513,3 +513,311 @@ def fit_logreg_baseline(
         print(f'  Brier score: {metrics['brier_score']:.4f}  (lower = better)')
         print(f'  ECE        : {metrics['ece']:.4f}  (lower = better)')
         print('=' * 60)
+        
+    coef_df = _extract_coefficients(best_pipeline, feature_cols)
+    if verbose: 
+        _print_coef_table(coef_df)
+    if plot:
+        _plot_calibration_curve(y, y_prob, save_dir=MODELS_DIR)
+        
+        
+    joblib.dump(best_pipeline, MODELS_DIR / 'logreg_elasticnet.joblib')
+    if calibrate:
+        joblib.dump(calibrated, MODELS_DIR / 'logreg_elasticnet_calibrated.joblib')
+    logger.info('Pipelines saved to %s', MODELS_DIR)
+
+    return {
+        'pipeline':            best_pipeline,
+        'calibrated_pipeline': final_estimator if calibrate else None,
+        'metrics':             metrics,
+        'feature_cols':        feature_cols,
+        'coef_df':             coef_df,
+        'best_params':         best_params,
+    }
+
+def _extract_coefficients(
+    pipeline: Pipeline,
+    feature_cols: list[str],
+) -> pd.DataFrame:
+    '''
+    Extracts logistic regression coefficients mapped to original feature names.
+    
+    Returns a Df with columns: feature, coefficient, abs_coeff.
+    Sorted by descending abs. value
+    '''
+    
+    clf = pipeline.named_steps['clf']
+    
+    coef = clf.coef_[0]
+    
+    preprocessor = pipeline.named_steps['preprocessor']
+    try:
+        transformed_names = list(
+            preprocessor.get_feature_names_out()
+        )
+    except AttributeError:
+        transformed_names = feature_cols
+        
+    coef_df = pd.DataFrame(
+        {
+            'feature' : transformed_names[: len(coef)],
+            'coefficient' : coef,
+            'abs_coefficient' : np.abs(coef),
+        }
+    ).sort_values('abs_coefficient', ascending=False)
+    
+    return coef_df.reset_index(drop=True)
+
+def _print_coef_table(coef_df: pd.DataFrame, top_n: int =15) -> None:
+    
+    '''
+    Print top-N positive and top_N negative coeffficients.
+    '''
+    
+    positive = (
+        coef_df[coef_df['coefficient'] > 0].nlargest(top_n, 'coefficient')[['feature', 'coefficient']]
+    )
+    negative = (
+        coef_df[coef_df['coefficient'] < 0].nsmallest(top_n, 'coefficient')[['feature', 'coefficient']]
+    )
+    
+    print(f'\n{'-' * 55}')
+    print(f' Top {top_n} POSITIVE coefficients (higher mortality risk)')
+    print(f'\n{'-' * 55}')
+    for _, row in positive.iterrows():
+        bar = "█" * max(1, int(abs(row["coefficient"]) * 8))
+        print(f' {row['feature']:<38s} {row['coefficient']:+.4f} {bar}')
+    print()
+    
+    
+    # ------------------------------------------------------------------
+    # Plot Calibration Curve
+    # ------------------------------------------------------------------
+
+def _plot_calibration_curve(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = 10,
+    save_dir: Path = MODELS_DIR,
+) -> Path:
+    '''
+    Saves a calibration curve to `save_dir`
+    
+    Returns the path of the saved figure.
+    '''
+    
+    fraction_pos, mean_pred = calibration_curve(
+        y_true, y_prob, n_bins=n_bins, strategy='uniform'
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(12,10))
+    ax = axes[0]
+    ax.plot([0,1], [0,1], linestyle='--', color='grey', label='Perfect Calibration') 
+    ax.plot(mean_pred, fraction_pos, marker='o', color='#2563EB', label='ElasticNet LR')
+    ax.set_xlabel('Mean predicted probabiltiy')
+    ax.set_ylabel('Fraction of Positives')
+    ax.set_title('Calibration curve (reliability diagram)')
+    ax.legend()
+    ax.set_xlim(0,1)
+    ax.set_ylim(0,1)
+    ax.grid(alpha=0.3)
+    
+    ax2 = axes[1]
+    ax2.hist(
+        y_prob[y_true == 0], bins=40, alpha=0.6, color='#64748B', label='Survived (y=0)'
+    )
+    ax2.hist(
+        y_prob[y_true == 1], bins=40, alpha=0.7, color='#DC2626', label='Died (y=1)'
+    )
+    ax2.set_xlabel('Predicted Probability of 24-h mortality')
+    ax2.set_ylabel('Count')
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+    
+    fig.suptitle('ElasticNet LogisticRegression - Calibration', fontsize=13, y=1.01)
+    fig.tight_layout()
+    
+    out_path = save_dir / 'logreg_calibration_curve.png'
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    logger.info('Calibration curve saved to %s', out_path)
+    return out_path
+
+
+    # ------------------------------------------------------------------
+    # compare_baselines()
+    # ------------------------------------------------------------------
+
+def compare_baselines(
+    df: pd.DataFrame,
+    feature_cols: list[str] | None = None,
+    sofa_threshold: int = 11,
+    calibrate_logreg: bool = True,
+    cv_folds: int = 5,
+    verbose: bool = True,
+    plot: bool = True,
+) -> pd.DataFrame:
+    '''
+    Fits both baselines on `df` and returns a clean comparison dataframe.
+    
+    This is the canonical entry point for the baseline module. The returned DataFrame schema is designed to accepet a TFT row later.
+     
+    schema: 
+        model | auroc | auprc | brier_score | ece | sensitivity | specificity | notes
+        
+    Params
+    ----------------
+    df: pd.DataFrame
+        the combined dataframe containing static features, time-averaged vitals and signs, SOFA component columns and `mortality_24h`.
+    feature_Cols: list[str]
+        Explicit feature list for the logistic regression. Auto-detected from recognised column names if None.
+    sofa_threshold: int
+        SOFA >= threshold for binary predictor modeling (default = 11).
+    calibrate_logreg: bool
+        whether or not to calibrate the logistic regression clf
+    cv_folds: int
+        folds for stratified/k-fold cross-validation
+    verbose: bool
+        deciding whether to print results/metrics/coefficients or not.
+    
+    Returns
+    ----------------
+    pd.DataFrame with one row per model and columns containing:
+        model | auroc | auprc | brier_score | ece | sensitivity | specificity | notes
+    '''
+    sofa_result = evaluate_sofa_baseline(
+        df, threshold=sofa_threshold, verbose=verbose
+    )
+    sm = sofa_result['metrics']
+    
+    logreg_result = fit_logreg_baseline(
+        df, 
+        feature_cols=feature_cols,
+        calibrate=calibrate_logreg,
+        cv_folds=cv_folds,
+        verbose=verbose,
+        plot=plot
+    )
+    lm = logreg_result['metrics']
+    
+    rows = [
+        {
+            'model' : 'SOFA Binary Predictor',
+            'auroc' : sm['auroc'],
+            'auprc' : sm['auprc'],
+            'brier_score' : np.nan,
+            'ece' : np.nan,
+            'sensitivity' : sm['sensitivity'],
+            'specificity' : sm['specificity'],
+            'notes' : f'threshold≥{sofa_threshold}; current clinical standard.',
+        },
+        {
+            'model' : 'ElasticNet LR',
+            'auroc' : lm['auroc'],
+            'auprc' : lm['auprc'],
+            'brier_score' : lm['brier_score'],
+            'ece' : lm['ece'],
+            'sensitivity' : np.nan,
+            'specificity' : np.nan,
+            'notes' : (
+                f'C={lm['best_C']}, l1_ratio={lm['best_l1_ratio']}; '
+                f'Isotonic calibration; {lm['n_features']} features.' 
+            ), 
+        },
+    ]
+    
+    compare_df = pd.DataFrame(rows).set_index('model')
+    
+    if verbose:
+        print('\n' + '=' * 60)
+        print('BASELINE COMPARISON TABLE')
+        print('=' * 60)
+        print(compare_df.to_string())
+        print(
+            '\n(TFT results row to be appended after model training.)\n'
+        )
+    out_csv = MODELS_DIR / 'baseline_comparison.csv'
+    compare_df.to_csv(out_csv)
+    logger.info('comparison table save to %s', out_csv)
+    
+    return compare_df
+
+
+    # ------------------------------------------------------------------
+    # synthetic dataset creator
+    # ------------------------------------------------------------------
+    
+def _make_syntehtic_df(n: int = 500, seed: int = 0) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    n_pos = max(1, int(n * 0.15)) 
+    # we can impute any kind of mortality rate 
+    y = np.zeros(n, dtype=int)
+    y[:n_pos] = 1
+    rng.shuffle(y)
+    
+    data: dict[str, Any] = {TARGET: y}
+
+    # We have our static, personal demographic identifiers
+    data["age_years"]            = rng.integers(18, 90, n).astype(float)
+    data["gender_male"]          = rng.integers(0, 2, n).astype(float)
+    data["van_walraven_score"]   = rng.integers(-7, 30, n).astype(float)
+    data["gcs_min_6h"]           = rng.integers(3, 15, n).astype(float)
+    data["gcs_mean_6h"]          = rng.uniform(3, 15, n)
+    data["sbp_min_6h"]           = rng.uniform(60, 180, n)
+    data["map_min_6h"]           = rng.uniform(40, 110, n)
+    data["first_careunit_encoded"] = rng.integers(0, 6, n).astype(float)
+    data["los_icu_days_prewindow"] = rng.exponential(2, n)
+
+    for flag in [
+        "race_White", "race_Black", "race_Hispanic", "race_Asian",
+        "elix_chf", "elix_renal_failure", "elix_liver_disease",
+        "elix_metastatic_cancer", "elix_coagulopathy",
+    ]:
+        data[flag] = rng.integers(0, 2, n).astype(float)
+
+    # Timeseries mean features
+    data["heart_rate__mean"]   = rng.uniform(50, 150, n)
+    data["sbp__mean"]          = rng.uniform(70, 180, n)
+    data["map__mean"]          = rng.uniform(50, 120, n)
+    data["resp_rate__mean"]    = rng.uniform(8, 40, n)
+    data["spo2__mean"]         = rng.uniform(85, 100, n)
+    data["temperature__mean"]  = rng.uniform(35, 40, n)
+    data["creatinine__max"]    = rng.exponential(1.5, n)
+    data["bilirubin__max"]     = rng.exponential(1.0, n)
+    data["platelet__min"]      = rng.uniform(20, 400, n)
+    data["lactate__mean"]      = rng.exponential(1.5, n)
+    data["bun__mean"]          = rng.uniform(5, 100, n)
+    data["glucose__mean"]      = rng.uniform(60, 300, n)
+    data["inr__mean"]          = rng.uniform(0.8, 5, n)
+    data["pao2__mean"]         = rng.uniform(60, 400, n)
+    data["fio2__mean"]         = rng.uniform(0.21, 1.0, n)
+
+    # SOFA components
+    data["pao2_fio2_ratio__min"] = data["pao2__mean"] / np.maximum(data["fio2__mean"], 0.21)
+    data["gcs_total__min"]       = rng.integers(3, 15, n).astype(float)
+    data["vasopressor_flag"]     = rng.integers(0, 2, n).astype(float)
+    data["urine_output_24h"]     = rng.exponential(1500, n)
+
+    # give slight noise 
+    data["creatinine__max"] += y * rng.uniform(0.5, 2.0, n)
+    data["lactate__mean"]   += y * rng.uniform(1.0, 3.0, n)
+    data["gcs_total__min"]  -= y * rng.uniform(1.0, 4.0, n)
+
+    return pd.DataFrame(data)
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)-8s %(message)s',
+    )
+    print('Running baselines on synthetic test, slight sanity check.')
+    synthetic = _make_syntehtic_df(n=600, seed=617)
+    results = compare_baselines(
+        synthetic,
+        sofa_threshold=11, 
+        calibrate_logreg=True,
+        cv_folds=3,
+        verbose=True,
+        plot=True,
+)
+    print(f'Final Comparison DataFrame:')
+    print(results)
