@@ -60,12 +60,15 @@ STATIC_FEATURES: list[str] = [
     # demographics
     'age_years',
     'gender_male',
+    
     'race_White',
     'race_Black',
     'race_Hispanic',
     'race_Asian',
+    
     'first_careunit_encoded',   
     'los_icu_days_prewindow',   
+    
     'gcs_min_6h',
     'gcs_mean_6h',
     'sbp_min_6h',
@@ -74,6 +77,7 @@ STATIC_FEATURES: list[str] = [
     'rr_max_6h',
     'temp_min_6h',
     'spo2_min_6h',
+    
     'elix_chf',
     'elix_cardiac_arrhythmias',
     'elix_valvular_disease',
@@ -105,6 +109,7 @@ STATIC_FEATURES: list[str] = [
     'elix_drug_abuse',
     'elix_psychoses',
     'elix_depression',
+    
     'van_walraven_score',
 ]
 
@@ -116,6 +121,7 @@ TIMESERIES_MEAN_FEATURES: list[str] = [
     'resp_rate__mean',
     'temperature__mean',
     'spo2__mean',
+    
     'glucose__mean',
     'wbc__mean',
     'hemoglobin__mean',
@@ -143,17 +149,21 @@ TIMESERIES_MEAN_FEATURES: list[str] = [
 ]
 
 SOFA_COLUMNS: dict[str, str] = {
-    'resp_pao2_fio2': 'pao2_fio2_ratio__min',   
-    'coag_platelets':  'platelet__min',         
-    'liver_bilirubin': 'bilirubin__max',        
-    'cardio_map':      'map__min',              
-    'cardio_vaso':     'vasopressor_flag',      
-    'cns_gcs':         'gcs_total__min',        
-    'renal_creatinine':'creatinine__max',       
-    'renal_urine':     'urine_output_24h',      
+    'resp': 'pao2_fio2_ratio__min',   
+    'coag':  'platelet__min',         
+    'liver': 'bilirubin__max',        
+    'map':      'map__min',              
+    'vaso':     'vasopressor_flag',      
+    'cns':         'gcs_total__min',        
+    'cr':'creatinine__max',       
+    'uo':     'urine_output_24h',      
 }
  
 TARGET = 'mortality_24h'
+
+# ============================================
+# ECE
+# ============================================
 
 
 def _expected_calibration_error(
@@ -253,8 +263,8 @@ def compute_sofa_score(df: pd.DataFrame) -> pd.Series:
         right=False,
     ).astype(int)
     
-    renal[uo < 200] = np.maximum(renal[uo < 200], 4)
-    renal[uo < 500] = np.maximum(renal[uo < 500], 3)
+    renal = renal.where(uo >= 500, other=np.maximum(renal, 3))
+    renal = renal.where(uo >= 200, other=np.maximum(renal, 4))
     
     sofa = resp + coag + liver + cardio + cns + renal
     sofa.name = 'sofa_score'
@@ -354,9 +364,9 @@ def _build_logreg_pipeline(
     '''
     
     numeric_transformer = Pipeline(
-        steps=[
+        [
             ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler())
+            ('scaler', StandardScaler()),
         ]
     )
     
@@ -376,13 +386,15 @@ def _build_logreg_pipeline(
     )
     # notes: l1_ratio=0 -> Ridge, l1_ratio=1 -> Lasso
     
-    return Pipeline(steps=[('preprocessor', preprocessor), ('clf', clf)])
+    return Pipeline([('preprocessor', preprocessor), ('clf', clf)])
 
 def fit_logreg_baseline(
-    df: pd.DataFrame,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
     feature_cols: list[str] | None = None,
     calibrate: bool = True,
     cv_folds: int = 5,
+    output_dir: Path = Path("models/baselines"),
     verbose: bool = True,
     plot: bool = True,
 ) -> dict[str, Any]:
@@ -391,14 +403,18 @@ def fit_logreg_baseline(
     
     Params
     --------
-    df: pd.DataFrame
-        Must contain feature_cols and mortality_24h
+    df_train: pd.DataFrame
+        Training Split, Must contain feature_cols and mortality_24h
+    df_test: pd.DataFrame
+        Held out test split, same schema as df_train    
     feature_cols : list[str] or None
         Columns to use as features/covariates. Defaults to all recognised static + timesereis mean columns that are present in df
     calibrate: bool
         If true, wrap the tuned estimator in 'CalibratedClassifierCV
     cv_folds : int
         Number of stratified CV folds for hyper-parameter search
+    output_dir: Path
+        Directory for saed pipelines and figures. Created if not exists
     verbose: bool
         If true, prints metrics and coefficients table.
     plot: bool
@@ -408,15 +424,18 @@ def fit_logreg_baseline(
     --------
     dict wt keys: pipeline, calibrated_pipeline (if calibrate), metrics, feature_cols, coef_df    
     '''
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    if TARGET not in df.columns:
-        raise KeyError(f"Target Column '{TARGET}' not found in DataFrame")
+    for split_name, split_df in [('df_train', df_train), ('df_test', df_test)]:
+        if TARGET not in split_df.columns:
+            raise KeyError(f"Target Column '{TARGET}' not found in {split_name}.")
     
     # time to determine feature cols
     
     if feature_cols is None:
         all_candidates = STATIC_FEATURES + TIMESERIES_MEAN_FEATURES
-        feature_cols = [c for c in all_candidates if c in df.columns]
+        feature_cols = [c for c in all_candidates if c in df_train.columns]
         if not feature_cols:
             raise ValueError(
                 'No recognised feature columns found in DataFrame.'
@@ -424,29 +443,28 @@ def fit_logreg_baseline(
             )
         logger.info('Auto-selected %d feature columns.', len(feature_cols))
         
-    missing_cols = [c for c in feature_cols if c not in df.columns]
-    if missing_cols:
-        logger.warning(
-            'REquested feature columns missing from df - dropping: %s', missing_cols
-        )
-        feature_cols = [c for c in feature_cols if c in df.columns]
+    dropped = [c for c in feature_cols if c not in df_train.columns]
+    if dropped:
+        logger.warning('Feature columns absent from df_train, dropping: %s', dropped)
+        feature_cols = [c for c in feature_cols if c in df_train.columns]
         
-    X = df[feature_cols].copy()
-    y= df[TARGET].astype(int).values
-    
+    X_train = df_train[feature_cols].copy()
+    y_train = df_train[TARGET].astype(int).values
+    X_test  = df_test[feature_cols].copy()
+    y_test  = df_test[TARGET].astype(int).values
+        
     param_grid = {
         'clf__C': [0.001, 0.01, 0.1, 1.0, 10.0],
         'clf__l1_ratio': [0.1, 0.3, 0.5, 0.7, 0.9],
     }            
-    base_pipeline = _build_logreg_pipeline(feature_cols)
+
     cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=617)
     if verbose:
-        print(f'\nRunning {cv_folds}-fold stratified CV over '
-              f'{len(param_grid['clf__C']) * len(param_grid['clf__l1_ratio'])} '
-              'hyper-parameter combinations …')
+        n_combs = len(param_grid['clf__C']) * len(param_grid['clf__l1_ratio'])
+        print(f'\n Running {cv_folds}-fold stratified CV over {n_combs} hyper parameter combinations.')
         
     gs = GridSearchCV(
-        estimator=base_pipeline,
+        estimator=_build_logreg_pipeline(feature_cols),
         param_grid=param_grid,
         scoring='roc_auc',
         cv=cv,
@@ -454,13 +472,13 @@ def fit_logreg_baseline(
         refit=True,
         verbose=0
     )
-    gs.fit(X, y)
+    gs.fit(X_train, y_train)
     best_pipeline: Pipeline = gs.best_estimator_
     best_params = gs.best_params_
     
     if verbose:
         print(f' Best Params: {best_params}')
-        print(f' CV AUROC: {gs.best_score_:.4f}')
+        print(f' CV AUROC: {gs.best_score_:.4f} train folds')
         
         
     # ------------------------------------------------------------------
@@ -472,22 +490,22 @@ def fit_logreg_baseline(
             method="isotonic",
             cv=cv_folds,
         )
-        calibrated.fit(X, y)
-        y_prob = calibrated.predict_proba(X)[:, 1]
+        calibrated.fit(X_train, y_train)
+        y_prob_test = calibrated.predict_proba(X_test)[:, 1]
         final_estimator = calibrated
     else:
-        y_prob = best_pipeline.predict_proba(X)[:, 1]
+        y_prob_test = best_pipeline.predict_proba(X_test)[:, 1]
         final_estimator = best_pipeline
         
         
     # ------------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------------
-    auroc  = roc_auc_score(y, y_prob)
-    auprc  = average_precision_score(y, y_prob)
-    brier  = brier_score_loss(y, y_prob)
-    ece    = _expected_calibration_error(y, y_prob)
-
+    auroc = roc_auc_score(y_test, y_prob_test)
+    auprc = average_precision_score(y_test, y_prob_test)
+    brier = brier_score_loss(y_test, y_prob_test)
+    ece   = _expected_calibration_error(y_test, y_prob_test)
+    
     metrics: dict[str, Any] = {
         'auroc':       round(auroc,  4),
         'auprc':       round(auprc,  4),
@@ -496,14 +514,19 @@ def fit_logreg_baseline(
         'best_C':      best_params['clf__C'],
         'best_l1_ratio': best_params['clf__l1_ratio'],
         'n_features':  len(feature_cols),
-        'n':           len(y),
-        'prevalence':  round(y.mean(), 4),
-    }   
+        'n_train':           len(y_test),
+        'n_test' :          len(y_test),
+        'prevalence_train': round(float(y_train.mean()), 4),
+        'prevalence_test' :  round(float(y_test.mean()),  4),
+    }
+       
     if verbose:
         print('\n' + '=' * 60)
-        print('BASELINE 2 — ElasticNet Logistic Regression')
-        print(f'  N          : {metrics['n']:,}')
-        print(f'  Prevalence : {metrics['prevalence']:.1%}')
+        print('BASELINE 2 — ElasticNet Logistic Regression  [TEST SET]')
+        print(f'  N train    : {metrics['n_train']:,}  '
+              f'(prev {metrics['prevalence_train']:.1%})')
+        print(f'  N test     : {metrics['n_test']:,}  '
+              f'(prev {metrics['prevalence_test']:.1%})')
         print(f'  Features   : {metrics['n_features']}')
         print(f'  Best C     : {metrics['best_C']}')
         print(f'  Best l1_ratio: {metrics['best_l1_ratio']}')
@@ -518,13 +541,13 @@ def fit_logreg_baseline(
     if verbose: 
         _print_coef_table(coef_df)
     if plot:
-        _plot_calibration_curve(y, y_prob, save_dir=MODELS_DIR)
+        _plot_calibration_curve(y_test, y_prob_test, save_dir=output_dir)
         
         
-    joblib.dump(best_pipeline, MODELS_DIR / 'logreg_elasticnet.joblib')
+    joblib.dump(best_pipeline, output_dir / 'logreg_elasticnet.joblib')
     if calibrate:
-        joblib.dump(calibrated, MODELS_DIR / 'logreg_elasticnet_calibrated.joblib')
-    logger.info('Pipelines saved to %s', MODELS_DIR)
+        joblib.dump(calibrated, output_dir / 'logreg_elasticnet_calibrated.joblib')
+    logger.info('Pipelines saved to %s', output_dir)
 
     return {
         'pipeline':            best_pipeline,
@@ -533,6 +556,8 @@ def fit_logreg_baseline(
         'feature_cols':        feature_cols,
         'coef_df':             coef_df,
         'best_params':         best_params,
+        'y_prob_test':         y_prob_test,
+        'y_test' :             y_test,
     }
 
 def _extract_coefficients(
@@ -568,17 +593,19 @@ def _extract_coefficients(
     
     return coef_df.reset_index(drop=True)
 
-def _print_coef_table(coef_df: pd.DataFrame, top_n: int =15) -> None:
+def _print_coef_table(coef_df: pd.DataFrame, top_n: int = 15) -> None:
     
     '''
     Print top-N positive and top_N negative coeffficients.
     '''
     
     positive = (
-        coef_df[coef_df['coefficient'] > 0].nlargest(top_n, 'coefficient')[['feature', 'coefficient']]
+        coef_df[coef_df['coefficient'] > 0]
+        .nlargest(top_n, 'coefficient')[['feature', 'coefficient']]
     )
     negative = (
-        coef_df[coef_df['coefficient'] < 0].nsmallest(top_n, 'coefficient')[['feature', 'coefficient']]
+        coef_df[coef_df['coefficient'] < 0]
+        .nsmallest(top_n, 'coefficient')[['feature', 'coefficient']]
     )
     
     print(f'\n{'-' * 55}')
@@ -598,7 +625,7 @@ def _plot_calibration_curve(
     y_true: np.ndarray,
     y_prob: np.ndarray,
     n_bins: int = 10,
-    save_dir: Path = MODELS_DIR,
+    save_dir: Path = Path("models/baselines"),
 ) -> Path:
     '''
     Saves a calibration curve to `save_dir`
@@ -636,7 +663,7 @@ def _plot_calibration_curve(
     fig.suptitle('ElasticNet LogisticRegression - Calibration', fontsize=13, y=1.01)
     fig.tight_layout()
     
-    out_path = save_dir / 'logreg_calibration_curve.png'
+    out_path = Path(save_dir) / "logreg_calibration_curve.png"
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     logger.info('Calibration curve saved to %s', out_path)
@@ -648,11 +675,13 @@ def _plot_calibration_curve(
     # ------------------------------------------------------------------
 
 def compare_baselines(
-    df: pd.DataFrame,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
     feature_cols: list[str] | None = None,
     sofa_threshold: int = 11,
     calibrate_logreg: bool = True,
     cv_folds: int = 5,
+    output_dir: Path = Path('models/baselines'),
     verbose: bool = True,
     plot: bool = True,
 ) -> pd.DataFrame:
@@ -684,19 +713,25 @@ def compare_baselines(
     pd.DataFrame with one row per model and columns containing:
         model | auroc | auprc | brier_score | ece | sensitivity | specificity | notes
     '''
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     sofa_result = evaluate_sofa_baseline(
-        df, threshold=sofa_threshold, verbose=verbose
+        df_test, threshold=sofa_threshold, verbose=verbose
     )
     sm = sofa_result['metrics']
     
     logreg_result = fit_logreg_baseline(
-        df, 
+        df_train=df_train,
+        df_test=df_test,
         feature_cols=feature_cols,
         calibrate=calibrate_logreg,
         cv_folds=cv_folds,
+        output_dir=output_dir,
         verbose=verbose,
-        plot=plot
+        plot=plot,
     )
+    
     lm = logreg_result['metrics']
     
     rows = [
@@ -742,82 +777,136 @@ def compare_baselines(
     return compare_df
 
 
+
+    # ------------------------------------------------------------------
+    # synthetic dataset creator
+    # ------------------------------------------------------------------
+
+def load_logreg_pipeline(
+    calibrated: bool = True,
+    otuput_dr: Path = Path('models/baselines'),
+) -> Pipeline:
+    fname = (
+        'logreg_elasticnet_calibrated.joblit'
+        if calibrated else 'logreg_elasticnet.joblib'
+    )
+    path = Path(otuput_dr) / fname
+    if not path.exists():
+        raise FileNotFoundError(
+            f'Pipeline not found: {path}\n'
+            'Run fit_log_reg_baseline() or compare_baselines() first.'
+        )
+    return joblib.load(path)
+
     # ------------------------------------------------------------------
     # synthetic dataset creator
     # ------------------------------------------------------------------
     
 def _make_syntehtic_df(n: int = 500, seed: int = 0) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    n_pos = max(1, int(n * 0.15)) 
-    # we can impute any kind of mortality rate 
+    n_pos = max(1, int(n * 0.15))
     y = np.zeros(n, dtype=int)
     y[:n_pos] = 1
     rng.shuffle(y)
-    
+ 
     data: dict[str, Any] = {TARGET: y}
-
-    # We have our static, personal demographic identifiers
-    data["age_years"]            = rng.integers(18, 90, n).astype(float)
-    data["gender_male"]          = rng.integers(0, 2, n).astype(float)
-    data["van_walraven_score"]   = rng.integers(-7, 30, n).astype(float)
-    data["gcs_min_6h"]           = rng.integers(3, 15, n).astype(float)
-    data["gcs_mean_6h"]          = rng.uniform(3, 15, n)
-    data["sbp_min_6h"]           = rng.uniform(60, 180, n)
-    data["map_min_6h"]           = rng.uniform(40, 110, n)
-    data["first_careunit_encoded"] = rng.integers(0, 6, n).astype(float)
-    data["los_icu_days_prewindow"] = rng.exponential(2, n)
-
+ 
+    # ── Static features - demopgrahic, personal info.
+    data['age_years']              = rng.integers(18, 90, n).astype(float)
+    data['gender_male']            = rng.integers(0, 2, n).astype(float)
+    data['van_walraven_score']     = rng.integers(-7, 30, n).astype(float)
+    data['gcs_min_6h']             = rng.integers(3, 15, n).astype(float)
+    data['gcs_mean_6h']            = rng.uniform(3, 15, n)
+    data['sbp_min_6h']             = rng.uniform(60, 180, n)
+    data['map_min_6h']             = rng.uniform(40, 110, n)
+    data['hr_max_6h']              = rng.uniform(50, 150, n)
+    data['rr_max_6h']              = rng.uniform(8, 40, n)
+    data['temp_min_6h']            = rng.uniform(35, 40, n)
+    data['spo2_min_6h']            = rng.uniform(85, 100, n)
+    data['first_careunit_encoded'] = rng.integers(0, 6, n).astype(float)
+    data['los_icu_days_prewindow'] = rng.exponential(2, n)
+ 
     for flag in [
-        "race_White", "race_Black", "race_Hispanic", "race_Asian",
-        "elix_chf", "elix_renal_failure", "elix_liver_disease",
-        "elix_metastatic_cancer", "elix_coagulopathy",
+        'race_White', 'race_Black', 'race_Hispanic', 'race_Asian',
+        'elix_chf', 'elix_renal_failure', 'elix_liver_disease',
+        'elix_metastatic_cancer', 'elix_coagulopathy',
     ]:
         data[flag] = rng.integers(0, 2, n).astype(float)
-
-    # Timeseries mean features
-    data["heart_rate__mean"]   = rng.uniform(50, 150, n)
-    data["sbp__mean"]          = rng.uniform(70, 180, n)
-    data["map__mean"]          = rng.uniform(50, 120, n)
-    data["resp_rate__mean"]    = rng.uniform(8, 40, n)
-    data["spo2__mean"]         = rng.uniform(85, 100, n)
-    data["temperature__mean"]  = rng.uniform(35, 40, n)
-    data["creatinine__max"]    = rng.exponential(1.5, n)
-    data["bilirubin__max"]     = rng.exponential(1.0, n)
-    data["platelet__min"]      = rng.uniform(20, 400, n)
-    data["lactate__mean"]      = rng.exponential(1.5, n)
-    data["bun__mean"]          = rng.uniform(5, 100, n)
-    data["glucose__mean"]      = rng.uniform(60, 300, n)
-    data["inr__mean"]          = rng.uniform(0.8, 5, n)
-    data["pao2__mean"]         = rng.uniform(60, 400, n)
-    data["fio2__mean"]         = rng.uniform(0.21, 1.0, n)
-
-    # SOFA components
-    data["pao2_fio2_ratio__min"] = data["pao2__mean"] / np.maximum(data["fio2__mean"], 0.21)
-    data["gcs_total__min"]       = rng.integers(3, 15, n).astype(float)
-    data["vasopressor_flag"]     = rng.integers(0, 2, n).astype(float)
-    data["urine_output_24h"]     = rng.exponential(1500, n)
-
-    # give slight noise 
-    data["creatinine__max"] += y * rng.uniform(0.5, 2.0, n)
-    data["lactate__mean"]   += y * rng.uniform(1.0, 3.0, n)
-    data["gcs_total__min"]  -= y * rng.uniform(1.0, 4.0, n)
-
+ 
+    # ── Timeseries features - mean imputed data  
+    data['heart_rate__mean']  = rng.uniform(50, 150, n)
+    data['sbp__mean']         = rng.uniform(70, 180, n)
+    data['map__mean']         = rng.uniform(50, 120, n)
+    data['resp_rate__mean']   = rng.uniform(8, 40, n)
+    data['spo2__mean']        = rng.uniform(85, 100, n)
+    data['temperature__mean'] = rng.uniform(35, 40, n)
+    data['bun__mean']         = rng.uniform(5, 100, n)
+    data['glucose__mean']     = rng.uniform(60, 300, n)
+    data['inr__mean']         = rng.uniform(0.8, 5, n)
+    data['pao2__mean']        = rng.uniform(60, 400, n)
+    data['fio2__mean']        = rng.uniform(0.21, 1.0, n)
+ 
+    # Signal-bearing features with addde noise
+    data['lactate__mean']  = rng.exponential(1.5, n) + y * rng.uniform(1.0, 3.0, n)
+    data['creatinine__mean'] = rng.exponential(1.0, n)
+    data['bilirubin__mean']  = rng.exponential(0.8, n)
+    data['platelet__mean']   = rng.uniform(50, 400, n)
+ 
+    # ── SOFA component columns
+    pao2 = data['pao2__mean']
+    fio2 = np.maximum(data['fio2__mean'], 0.21)
+    data['pao2_fio2_ratio__min'] = pao2 / fio2
+ 
+    # Worst creatinine/bilirubin/platelet = mean + noise toward the bad end
+    data['creatinine__max'] = (
+        data['creatinine__mean'] + rng.exponential(0.5, n)
+        + y * rng.uniform(0.5, 2.0, n)
+    )
+    data['bilirubin__max']  = data['bilirubin__mean'] + rng.exponential(0.3, n)
+    data['platelet__min']   = np.maximum(
+        data['platelet__mean'] - rng.uniform(0, 80, n), 5
+    )
+ 
+    data['map__min']        = (
+        data['map__mean'] - rng.uniform(5, 30, n)
+    ).clip(30, 130)
+    data['gcs_total__min']  = (
+        rng.integers(3, 15, n).astype(float) - y * rng.uniform(1.0, 4.0, n)
+    ).clip(3, 15)
+    data['vasopressor_flag'] = rng.integers(0, 2, n).astype(float)
+    data['urine_output_24h'] = np.maximum(
+        rng.exponential(1500, n) - y * rng.uniform(0, 600, n), 0
+    )
+ 
     return pd.DataFrame(data)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    
+    from sklearn.model_selection import train_test_split
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s %(levelname)-8s %(message)s',
     )
     print('Running baselines on synthetic test, slight sanity check.')
-    synthetic = _make_syntehtic_df(n=600, seed=617)
+    synthetic = _make_syntehtic_df(n=800, seed=617)
+    
+    df_train, df_test = train_test_split(
+        synthetic, test_size=0.2, stratify=synthetic[TARGET], random_state=617
+    )
+    
+    print(f'Train: {len(df_train)} rows  |  Test: {len(df_test)} rows')
+    print(f'Train prevalence: {df_train[TARGET].mean():.1%}  |  '
+          f'Test prevalence: {df_test[TARGET].mean():.1%}\n')
+ 
     results = compare_baselines(
-        synthetic,
-        sofa_threshold=11, 
+        df_train=df_train,
+        df_test=df_test,
+        sofa_threshold=11,
         calibrate_logreg=True,
         cv_folds=3,
+        output_dir=Path("models/baselines"),
         verbose=True,
         plot=True,
-)
+    )
     print(f'Final Comparison DataFrame:')
-    print(results)
+    print(results.to_string())
